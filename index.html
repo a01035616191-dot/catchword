@@ -170,9 +170,14 @@ async function api(path, method, body) {
   if (method === undefined) method = "GET";
   if (body === undefined) body = null;
   const db = getDb();
-  
-  // Route API calls to Supabase
-  if (path === "/settings") {
+
+  // Parse path and query string
+  const [pathOnly, qs] = path.split("?");
+  const params = {};
+  if (qs) qs.split("&").forEach(p => { const [k,v] = p.split("="); params[k] = decodeURIComponent(v||""); });
+
+  // /settings
+  if (pathOnly === "/settings") {
     if (method === "GET") {
       const { data } = await db.from("catchword_settings").select("*").eq("id", 1).single();
       return data || {};
@@ -182,9 +187,10 @@ async function api(path, method, body) {
       return body;
     }
   }
-  if (path === "/books" || path.startsWith("/books")) {
-    const bookId = path.split("/")[2];
-    if (method === "GET" && !bookId) {
+
+  // /books
+  if (pathOnly === "/books") {
+    if (method === "GET") {
       const { data } = await db.from("catchword_books").select("*").order("created_at", {ascending:false});
       return data || [];
     }
@@ -192,43 +198,54 @@ async function api(path, method, body) {
       const { data } = await db.from("catchword_books").insert(body).select().single();
       return data;
     }
-    if (method === "DELETE" && bookId) {
-      await db.from("catchword_books").delete().eq("id", bookId);
-      return {};
-    }
   }
-  if (path === "/pages" && method === "POST") {
-    // bulk insert pages: body = {pages: [{book_id, page_number, content}]}
-    const rows = body.pages || body;
-    await db.from("catchword_pages").insert(rows);
+
+  // /books/{id} DELETE
+  const bookMatch = pathOnly.match(/^\/books\/([^/]+)$/);
+  if (bookMatch && method === "DELETE") {
+    await db.from("catchword_books").delete().eq("id", bookMatch[1]);
     return {};
   }
-  if (path.includes("/pages")) {
-    const parts = path.split("/");
-    const bookId = parts[2];
+
+  // /pages GET: ?book_id=...&page=N (single page) or ?book_id=... (list)
+  // /pages POST: bulk insert {pages:[...]}
+  if (pathOnly === "/pages") {
+    if (method === "POST") {
+      const rows = (body && body.pages) ? body.pages : body;
+      const { error } = await db.from("catchword_pages").insert(rows);
+      if (error) throw new Error(error.message);
+      return {};
+    }
     if (method === "GET") {
-      const pageNum = parts[4] ? parseInt(parts[4]) : null;
+      const bookId = params.book_id;
+      const pageNum = params.page ? parseInt(params.page) : null;
       if (pageNum !== null) {
         const { data } = await db.from("catchword_pages").select("*").eq("book_id", bookId).eq("page_number", pageNum).single();
         return data || {};
       }
-      const { data } = await db.from("catchword_pages").select("page_number").eq("book_id", bookId).order("page_number");
+      const { data } = await db.from("catchword_pages").select("id, page_number").eq("book_id", bookId).order("page_number");
       return data || [];
     }
   }
-  if (path.includes("/annotations")) {
-    const parts = path.split("/");
-    const bookId = parts[2];
-    const pageNum = parts[4] ? parseInt(parts[4]) : null;
+
+  // /annotations GET: ?book_id=... or ?page_id=...
+  // /annotations POST: create annotation
+  if (pathOnly === "/annotations") {
     if (method === "GET") {
-      let q = db.from("catchword_annotations").select("*, catchword_pages!inner(page_number)").eq("book_id", bookId);
-      if (pageNum !== null) q = q.eq("catchword_pages.page_number", pageNum);
-      const { data } = await q.order("created_at");
-      return (data || []).map(a => ({...a, page_number: a.catchword_pages?.page_number}));
+      if (params.page_id) {
+        const { data } = await db.from("catchword_annotations").select("*").eq("page_id", params.page_id).order("created_at");
+        return data || [];
+      }
+      if (params.book_id) {
+        const { data } = await db.from("catchword_annotations").select("*, catchword_pages!inner(page_number)").eq("book_id", params.book_id).order("created_at");
+        return (data || []).map(a => ({...a, page_number: a.catchword_pages?.page_number}));
+      }
+      return [];
     }
     if (method === "POST") {
-      // Get page_id first
-      const { data: pg } = await db.from("catchword_pages").select("id").eq("book_id", bookId).eq("page_number", body.page_number).single();
+      const bookId = body.book_id;
+      const pageNum = body.page_number;
+      const { data: pg } = await db.from("catchword_pages").select("id").eq("book_id", bookId).eq("page_number", pageNum).single();
       if (!pg) return {};
       const ins = {page_id: pg.id, book_id: bookId, paragraph_index: body.paragraph_index, author: body.author, content: body.content};
       if (body.quote) ins.quote = body.quote;
@@ -237,14 +254,16 @@ async function api(path, method, body) {
       return data;
     }
   }
-  if (path.includes("/progress")) {
-    const bookId = path.split("/")[2];
+
+  // /progress GET: ?book_id=... POST: {book_id, current_page}
+  if (pathOnly === "/progress") {
     if (method === "GET") {
-      const { data } = await db.from("catchword_progress").select("*").eq("book_id", bookId).single();
+      const { data } = await db.from("catchword_progress").select("*").eq("book_id", params.book_id).single();
       return data || {current_page: 1};
     }
-    if (method === "PATCH") {
-      const { data: ex } = await db.from("catchword_progress").select("id").eq("book_id", bookId).single();
+    if (method === "POST" || method === "PATCH") {
+      const bookId = body.book_id;
+      const { data: ex } = await db.from("catchword_progress").select("id").eq("book_id", bookId).maybeSingle();
       if (ex) {
         await db.from("catchword_progress").update({current_page: body.current_page, updated_at: new Date().toISOString()}).eq("book_id", bookId);
       } else {
@@ -253,6 +272,7 @@ async function api(path, method, body) {
       return body;
     }
   }
+
   return {};
 }
 
