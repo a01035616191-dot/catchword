@@ -9,6 +9,7 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📖</text></svg>">
 <link href="https://fonts.googleapis.com/css2?family=DotGothic16&family=Noto+Serif+SC:wght@400;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   :root {
     --bg: #f0f4f8; --card: #f7f9fb; --border: #7a8590; --accent: #6b92b5;
@@ -152,38 +153,106 @@ const {
 } = React;
 
 // ─── API ────────────────────────────────────────────────────────────────
-function getApiUrl() {
-  try {
-    var hash = window.location.hash.slice(1);
-    if (hash && hash.startsWith("http")) {
-      var full = hash.replace(/\/$/, "") + "/functions/v1/catchword";
-      localStorage.setItem("catchword_api_url", full);
-      return full;
-    }
-    return localStorage.getItem("catchword_api_url") || "";
-  } catch (e) {
-    return "";
-  }
+// ─── Supabase Direct Config ────────────────────────────────────────────
+const SB_URL = "https://krhohnpepfqqpiuuaqjt.supabase.co";
+const SB_KEY = "sb_publishable_fZPFZUrBLI3SPMI1BANq8w_gknyB2-z";
+let _db = null;
+function getDb() {
+  if (!_db) _db = supabase.createClient(SB_URL, SB_KEY);
+  return _db;
 }
-function setApiUrl(url) {
-  try {
-    localStorage.setItem("catchword_api_url", url);
-  } catch (e) {}
-}
-let API = getApiUrl();
+
+function getApiUrl() { return SB_URL; }
+function setApiUrl(url) {}
+let API = SB_URL;
+
 async function api(path, method, body) {
   if (method === undefined) method = "GET";
   if (body === undefined) body = null;
-  var opts = {
-    method: method,
-    headers: {
-      "Content-Type": "application/json"
+  const db = getDb();
+  
+  // Route API calls to Supabase
+  if (path === "/settings") {
+    if (method === "GET") {
+      const { data } = await db.from("catchword_settings").select("*").eq("id", 1).single();
+      return data || {};
     }
-  };
-  if (body) opts.body = JSON.stringify(body);
-  var res = await fetch(API + path, opts);
-  if (!res.ok) throw new Error("" + res.status);
-  return res.json();
+    if (method === "PATCH") {
+      await db.from("catchword_settings").update(body).eq("id", 1);
+      return body;
+    }
+  }
+  if (path === "/books" || path.startsWith("/books")) {
+    const bookId = path.split("/")[2];
+    if (method === "GET" && !bookId) {
+      const { data } = await db.from("catchword_books").select("*").order("created_at", {ascending:false});
+      return data || [];
+    }
+    if (method === "POST") {
+      const { data } = await db.from("catchword_books").insert(body).select().single();
+      return data;
+    }
+    if (method === "DELETE" && bookId) {
+      await db.from("catchword_books").delete().eq("id", bookId);
+      return {};
+    }
+  }
+  if (path.includes("/pages")) {
+    const parts = path.split("/");
+    const bookId = parts[2];
+    if (method === "GET") {
+      const pageNum = parseInt(parts[4]);
+      if (parts[3] === "pages" && parts[4]) {
+        const { data } = await db.from("catchword_pages").select("*").eq("book_id", bookId).eq("page_number", pageNum).single();
+        return data || {};
+      }
+      const { data } = await db.from("catchword_pages").select("page_number").eq("book_id", bookId).order("page_number");
+      return data || [];
+    }
+    if (method === "POST") {
+      const rows = body.map((p) => ({book_id: bookId, page_number: p.page_number, content: p.content}));
+      await db.from("catchword_pages").insert(rows);
+      return {};
+    }
+  }
+  if (path.includes("/annotations")) {
+    const parts = path.split("/");
+    const bookId = parts[2];
+    const pageNum = parts[4] ? parseInt(parts[4]) : null;
+    if (method === "GET") {
+      let q = db.from("catchword_annotations").select("*, catchword_pages!inner(page_number)").eq("book_id", bookId);
+      if (pageNum !== null) q = q.eq("catchword_pages.page_number", pageNum);
+      const { data } = await q.order("created_at");
+      return (data || []).map(a => ({...a, page_number: a.catchword_pages?.page_number}));
+    }
+    if (method === "POST") {
+      // Get page_id first
+      const { data: pg } = await db.from("catchword_pages").select("id").eq("book_id", bookId).eq("page_number", body.page_number).single();
+      if (!pg) return {};
+      const ins = {page_id: pg.id, book_id: bookId, paragraph_index: body.paragraph_index, author: body.author, content: body.content};
+      if (body.quote) ins.quote = body.quote;
+      if (body.parent_id) { ins.parent_id = body.parent_id; ins.depth = 1; }
+      const { data } = await db.from("catchword_annotations").insert(ins).select().single();
+      return data;
+    }
+  }
+  if (path.includes("/progress")) {
+    const bookId = path.split("/")[2];
+    if (method === "GET") {
+      const { data } = await db.from("catchword_progress").select("*").eq("book_id", bookId).single();
+      return data || {current_page: 1};
+    }
+    if (method === "PATCH") {
+      const { data: ex } = await db.from("catchword_progress").select("id").eq("book_id", bookId).single();
+      if (ex) {
+        await db.from("catchword_progress").update({current_page: body.current_page, updated_at: new Date().toISOString()}).eq("book_id", bookId);
+      } else {
+        await db.from("catchword_progress").insert({book_id: bookId, current_page: body.current_page});
+      }
+      return body;
+    }
+  }
+  return {};
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────
@@ -1418,7 +1487,7 @@ function SettingsModal({
 
 // ─── Main App ───────────────────────────────────────────────────────────
 function App() {
-  var s0 = useState(!!getApiUrl()),
+  var s0 = useState(true),
     ready = s0[0],
     setReady = s0[1];
   var s1 = useState("library"),
